@@ -24,6 +24,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSortedMap;
 import com.google.common.collect.Maps;
+import com.google.common.flogger.GoogleLogger;
 import com.google.common.util.concurrent.Futures;
 import com.google.devtools.build.lib.actions.FileValue;
 import com.google.devtools.build.lib.analysis.BlazeDirectories;
@@ -79,6 +80,7 @@ import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
 import java.nio.file.Paths;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
@@ -144,6 +146,8 @@ public abstract class StarlarkBaseExternalContext implements AutoCloseable, Star
     @Override
     void close();
   }
+
+  private static final GoogleLogger logger = GoogleLogger.forEnclosingClass();
 
   /** Max. length of command line args added as a profiler description. */
   private static final int MAX_PROFILE_ARGS_LEN = 512;
@@ -1095,19 +1099,33 @@ the same path on case-insensitive filesystems.
     }
 
     StructImpl downloadResult = calculateDownloadResult(checksum, downloadedPath);
-    try {
-      if (downloadDirectory.exists()) {
-        downloadDirectory.deleteTree();
+    // Retry the deleteTree a while, if necessary, to cope with filesytems where unlinks are not atomic
+    Instant start = Instant.now();
+    Instant deadline = start.plus(Duration.ofSeconds(1));
+    for (int attempts = 0; ; attempts++) {
+      try {
+        if (downloadDirectory.exists()) {
+          downloadDirectory.deleteTree();
+        }
+        if (attempts > 1) {
+          long elapsedMillis = Duration.between(start, Instant.now()).toMillis();
+          logger.atInfo().log("Cleaning up %s took %d attempts over %dms.", downloadDirectory.getPathString(), attempts, elapsedMillis);
+        }
+        break;
+      } catch (IOException e) {
+        if (Instant.now().isAfter(deadline)) {
+          throw new RepositoryFunctionException(
+                  new IOException(
+                          "Couldn't delete temporary directory ("
+                                  + downloadDirectory.getPathString()
+                                  + ") after "
+                                  + attempts
+                                  + " attempts: "
+                                  + e.getMessage(),
+                          e),
+                  Transience.TRANSIENT);
+        }
       }
-    } catch (IOException e) {
-      throw new RepositoryFunctionException(
-          new IOException(
-              "Couldn't delete temporary directory ("
-                  + downloadDirectory.getPathString()
-                  + "): "
-                  + e.getMessage(),
-              e),
-          Transience.TRANSIENT);
     }
     return downloadResult;
   }
